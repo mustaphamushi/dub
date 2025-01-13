@@ -1,3 +1,4 @@
+export const dynamic = "force-dynamic";
 import { getAnalytics } from "@/lib/analytics/get-analytics";
 import { validDateRangeForPlan } from "@/lib/analytics/utils";
 import {
@@ -15,9 +16,9 @@ import { NextResponse } from "next/server";
 
 export const GET = async (req: Request) => {
   try {
-    // Parse and validate search parameters
     const searchParams = getSearchParams(req.url);
     const parsedParams = analyticsQuerySchema.parse(searchParams);
+
     const { groupBy, domain, key, interval, start, end } = parsedParams;
 
     if (!domain || !key) {
@@ -28,18 +29,22 @@ export const GET = async (req: Request) => {
     }
 
     let link;
-    const demoLink = DUB_DEMO_LINKS.find((l) => l.domain === domain && l.key === key);
 
+    const demoLink = DUB_DEMO_LINKS.find(
+      (l) => l.domain === domain && l.key === key,
+    );
+
+    // if it's a demo link
     if (demoLink) {
-      // Handle demo links
       link = {
         id: demoLink.id,
         projectId: DUB_WORKSPACE_ID,
       };
     } else {
-      // Fetch the link from the database
       link = await prisma.link.findUnique({
-        where: { domain_key: { domain, key } },
+        where: {
+          domain_key: { domain, key },
+        },
         select: {
           id: true,
           dashboard: true,
@@ -55,6 +60,7 @@ export const GET = async (req: Request) => {
         },
       });
 
+      // if the link is explicitly private (publicStats === false)
       if (!link?.dashboard) {
         throw new DubApiError({
           code: "forbidden",
@@ -62,37 +68,40 @@ export const GET = async (req: Request) => {
         });
       }
 
-      // Validate date range for the plan
+      const workspace = link.project;
+
       validDateRangeForPlan({
-        plan: link.project?.plan || "free",
-        conversionEnabled: link.project?.conversionEnabled,
+        plan: workspace?.plan || "free",
+        conversionEnabled: workspace?.conversionEnabled,
         interval,
         start,
         end,
         throwError: true,
       });
 
-      // Check usage limits
-      if (link.project && link.project.usage > link.project.usageLimit) {
+      if (workspace && workspace.usage > workspace.usageLimit) {
         throw new DubApiError({
           code: "forbidden",
           message: exceededLimitError({
-            plan: link.project.plan as PlanProps,
-            limit: link.project.usageLimit,
+            plan: workspace.plan as PlanProps,
+            limit: workspace.usageLimit,
             type: "clicks",
           }),
         });
       }
     }
 
-    // Implement rate limiting in production
+    // Rate limit in production
     if (process.env.NODE_ENV !== "development") {
       const ip = ipAddress(req);
-      const rateLimitDuration = demoLink ? (groupBy === "count" ? "10 s" : "1 m") : "10 s";
-      const rateLimitCount = demoLink ? 15 : 10;
-      
-      const { success } = await ratelimit(rateLimitCount, rateLimitDuration)
-        .limit(`analytics-dashboard:${link.id}:${ip}:${groupBy}`);
+      // for demo links, we rate limit at:
+      // - 15 requests per 10 seconds if groupBy is "count"
+      // - 15 request per minute if groupBy is not "count"
+      // for non-demo links, we rate limit at 10 requests per 10 seconds
+      const { success } = await ratelimit(
+        demoLink ? 15 : 10,
+        !demoLink || groupBy === "count" ? "10 s" : "1 m",
+      ).limit(`analytics-dashboard:${link.id}:${ip}:${groupBy}`);
 
       if (!success) {
         throw new DubApiError({
@@ -102,9 +111,9 @@ export const GET = async (req: Request) => {
       }
     }
 
-    // Fetch analytics data
     const response = await getAnalytics({
       ...parsedParams,
+      // workspaceId can be undefined (for public links that haven't been claimed/synced to a workspace)
       ...(link.projectId && { workspaceId: link.projectId }),
       linkId: link.id,
     });
